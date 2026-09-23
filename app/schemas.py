@@ -139,6 +139,53 @@ class JobSummary(BaseModel):
     perf_onset_count: int
 
 
+class TempoEvent(BaseModel):
+    event_index: int = Field(..., description="事件序号（按参考拍顺序，0 基）")
+    ref_start_index: int = Field(..., description="起拍：起始参考拍索引（0 基）")
+    ref_end_index: int = Field(..., description="结束参考拍索引（含）")
+    ref_start_time: float
+    ref_end_time: float
+    perf_start_time: float = Field(
+        ..., description="起始参考拍对应演奏音时间（事件在演奏侧的起拍）"
+    )
+    bpm: float = Field(..., description="该稳定区间的速度（窗口中位数，拍/分钟）")
+    beat_count: int = Field(
+        ..., description="覆盖参考拍数（含起拍，= interval_count+1，事件间隔均有效）"
+    )
+    interval_count: int = Field(..., description="压缩进该事件的有效间隔数")
+
+
+class IgnoredTempoInterval(BaseModel):
+    interval_index: int = Field(
+        ..., description="被忽略的间隔索引（matched_beats 相邻对序号，0 基）"
+    )
+    ref_start_index: int
+    ref_end_index: int
+    ref_start_time: float
+    ref_end_time: float
+    ref_span: int = Field(..., description="间隔跨越的参考拍数（>1 通常意味着漏拍）")
+    perf_span: int = Field(..., description="间隔跨越的演奏音数（>1 通常意味着插入拍）")
+    raw_bpm: float | None = Field(..., description="原始瞬时 BPM（无法计算时为 null）")
+    median_bpm: float | None = Field(..., description="窗口中位 BPM（无法计算时为 null）")
+    reasons: list[str] = Field(
+        ...,
+        description="忽略原因：below_min_bpm / above_max_bpm / outlier / non_positive_interval",
+    )
+
+
+class TempoMap(BaseModel):
+    parameters: dict[str, Any]
+    matched_beat_count: int
+    interval_count: int
+    event_count: int
+    ignored_count: int
+    events: list[TempoEvent] = Field(..., description="按参考拍排序的 tempo events")
+    ignored_indices: list[int] = Field(..., description="被忽略的间隔索引列表")
+    ignored_intervals: list[IgnoredTempoInterval] = Field(
+        ..., description="被忽略间隔的详细信息（原因、跨度与原始/中位 BPM）"
+    )
+
+
 class JobOut(BaseModel):
     id: int
     name: str | None

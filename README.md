@@ -16,6 +16,11 @@
 之间的若干独立子段分别寻优，再合并为完整路径——锚点保证被采用，段内仍允许
 漏拍、插入拍与连续偏差。
 
+对齐完成后可调用 `GET /jobs/{id}/tempo-map` 导出**节奏曲线（tempo map）**：
+根据 `matched_beats` 相邻匹配的参考 / 演奏间隔估计局部 BPM，用居中**中位数
+窗口**抑制漏拍 / 插入拍造成的异常间隔，再把稳定区间压缩为按参考拍排序的
+**tempo events**（起拍、BPM、覆盖拍数），被忽略的异常间隔单独列出。
+
 ## 目录结构
 
 ```
@@ -23,10 +28,11 @@
 ├── app/
 │   ├── main.py          # FastAPI 路由
 │   ├── alignment.py     # 带宽约束 DTW 核心算法（纯标准库，含锚点分段对齐）
+│   ├── tempo.py         # 节奏曲线估计：中位数窗口 + tempo events 压缩
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   ├── database.py      # SQLite 连接、建表与旧库迁移
 │   └── crud.py          # 任务读写
-├── tests/               # unittest 测试（算法 18 个 + 接口 14 个）
+├── tests/               # unittest 测试（算法 18 个 + 节奏曲线 10 个 + 接口 19 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -74,6 +80,7 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 | POST   | `/jobs/{id}/align`         | 执行（锚点约束）DTW 对齐并保存结果     |
 | GET    | `/jobs/{id}`               | 查询任务（含完整输入、锚点与结果）     |
 | GET    | `/jobs/{id}/result`        | 只查询对齐结果（含已采用锚点）         |
+| GET    | `/jobs/{id}/tempo-map`     | 导出节奏曲线（tempo events + 被忽略间隔） |
 | GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
 | GET    | `/health`                  | 健康检查                               |
 
@@ -146,7 +153,10 @@ curl -s -X POST http://localhost:8000/jobs/$ID/align
 # 3) 查询结果
 curl -s http://localhost:8000/jobs/$ID/result
 
-# 4) 列出全部任务
+# 4) 导出节奏曲线（可带估计参数）
+curl -s "http://localhost:8000/jobs/$ID/tempo-map?window_beats=5&min_bpm=40&max_bpm=300"
+
+# 5) 列出全部任务
 curl -s http://localhost:8000/jobs
 ```
 
@@ -226,6 +236,93 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 - `statistics`：配对数量、抢/准/拖计数、平均偏差、平均绝对偏差、RMS、
   最大绝对偏差、路径总代价与按路径长度归一化的代价。
 
+## 节奏曲线导出（`GET /jobs/{id}/tempo-map`）
+
+任务**已完成（`done`）**后可导出节奏曲线。对 `matched_beats` 按参考拍顺序的
+每一对相邻匹配，用演奏侧时间差计算瞬时 BPM（`bpm = 60 / Δperf_time`）：
+
+1. **中位数窗口稳健化**：每条间隔取居中窗口内瞬时 BPM 的中位数作为局部 BPM。
+   漏拍会让一次间隔的时间差翻倍（瞬时 BPM 掉到一半）、极端插入错配会让时间差
+   减半（BPM 翻倍），中位数窗口不受这种孤立异常影响；
+2. **异常间隔判定**：原始瞬时 BPM 超出 `[min_bpm, max_bpm]`，或与窗口中位数的
+   相对偏差超过 20%（`outlier`）的间隔被忽略，并在 `ignored_indices` /
+   `ignored_intervals` 中给出索引、参考 / 演奏跨度与原因；
+3. **压缩为 tempo events**：索引连续、且局部 BPM 相对事件锚点的偏差不超过 2%
+   的间隔归并为同一事件。被忽略间隔的两侧即使 BPM 相同也不合并（该间隔速度
+   未知）。事件按参考拍排序，给出起拍、BPM 与覆盖拍数。
+
+### 查询参数
+
+| 参数 | 类型 | 默认 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `window_beats` | int，`[1, 128]` | `5` | 中位数窗口的间隔（拍）数上限，实际窗口取**不大于该值的奇数**（`5→5`、`4→3`、`1→1`），边界处收窄 |
+| `min_bpm` | float，`> 0` | `40` | 合法 BPM 下限，低于此值的间隔忽略（`below_min_bpm`） |
+| `max_bpm` | float，`> 0` | `300` | 合法 BPM 上限，高于此值的间隔忽略（`above_max_bpm`） |
+
+`min_bpm >= max_bpm` 返回 `400`；参数类型 / 范围非法（如 `window_beats=0`、
+`min_bpm=-1`）返回 `422`。
+
+### 响应结构（节选）
+
+```json
+{
+  "parameters": {
+    "window_beats": 5, "window_size": 5,
+    "min_bpm": 40.0, "max_bpm": 300.0,
+    "outlier_tolerance": 0.2, "compression_tolerance": 0.02
+  },
+  "matched_beat_count": 8,
+  "interval_count": 7,
+  "event_count": 2,
+  "ignored_count": 1,
+  "events": [
+    {
+      "event_index": 0,
+      "ref_start_index": 0,
+      "ref_end_index": 1,
+      "ref_start_time": 0.0,
+      "ref_end_time": 0.5,
+      "perf_start_time": 0.0,
+      "bpm": 120.0,
+      "beat_count": 2,
+      "interval_count": 1
+    }
+  ],
+  "ignored_indices": [1],
+  "ignored_intervals": [
+    {
+      "interval_index": 1,
+      "ref_start_index": 1, "ref_end_index": 3,
+      "ref_start_time": 0.5, "ref_end_time": 1.5,
+      "ref_span": 2, "perf_span": 1,
+      "raw_bpm": 60.0, "median_bpm": 120.0,
+      "reasons": ["outlier"]
+    }
+  ]
+}
+```
+
+- `events[].bpm`：该稳定区间的速度（拍/分钟，区间内平滑 BPM 的中位数，
+  保留 2 位小数）。
+- `events[].beat_count`：覆盖的参考拍数（含起拍，`= interval_count + 1`；
+  事件内所有间隔均通过了异常检测）。
+- `events[].perf_start_time`：起拍在演奏侧的时间（可直接作为时间拉伸 /
+  变速处理的入点）。
+- `ignored_indices`：被忽略间隔的 0 基序号（按参考拍顺序，即
+  `matched_beats[k] → matched_beats[k+1]` 的 `k`）。
+- `ignored_intervals[]`：`ref_span > 1` 通常意味着中间有漏拍，
+  `perf_span > 1` 通常意味着中间有插入拍；`reasons` 取值
+  `below_min_bpm` / `above_max_bpm` / `outlier` / `non_positive_interval`。
+- 所有间隔都被忽略时（例如 BPM 范围过窄）返回 `200`，`events` 为 `[]`、
+  全部间隔出现在 `ignored_indices` 中。
+
+### 错误状态
+
+- `404` 任务不存在；
+- `409` 任务尚未完成（`pending`）、上次对齐失败（`error`），或匹配拍不足 2 个
+  （无法形成任何间隔，如参考 / 演奏都只有一个音）；
+- `400` `min_bpm >= max_bpm`；`422` 查询参数类型 / 范围非法。
+
 ## 算法说明
 
 设参考拍 `r₀..rₙ₋₁`、演奏音 `p₀..pₘ₋₁`，代价矩阵单元
@@ -263,10 +360,12 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
 
 ## 状态码
 
-- `201` 任务创建成功；`200` 对齐 / 查询成功
+- `201` 任务创建成功；`200` 对齐 / 查询 / 节奏曲线导出成功
 - `400` 带宽不足无法对齐（含 `|n−m| > band_width` 预检）、惩罚参数非法，
   或锚点校验失败（索引为负 / 越界 / 非严格递增 / 超出带宽不可达），
-  `detail` 中会给出具体锚点与原因
-- `404` 任务不存在
-- `409` 对尚未对齐（`pending`）的任务调用 `/result`
-- `422` 请求体校验失败（空序列、非递增、字段类型错误等）
+  `detail` 中会给出具体锚点与原因；tempo-map 的 `min_bpm >= max_bpm` 同样返回 400
+- `404` 任务不存在（含 `/tempo-map`）
+- `409` 对尚未对齐（`pending`）的任务调用 `/result`；对未完成、对齐失败或
+  匹配拍不足 2 个的任务调用 `/tempo-map`
+- `422` 请求体或查询参数校验失败（空序列、非递增、字段类型错误、
+  `window_beats` 越界等）

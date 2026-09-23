@@ -210,6 +210,127 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["result"]["anchors"], [])
 
+    def test_tempo_map_full_flow(self):
+        # 120 BPM 的稳定片段 + 一处漏拍（1.0s），漏拍间隔应被忽略
+        r = self.client.post("/jobs", json={
+            "name": "tempo-take",
+            "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+            "performance_onsets": [0.0, 0.5, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+            "params": {"band_width": 2},
+        })
+        job_id = r.json()["id"]
+
+        # 未完成 → 409
+        r = self.client.get(f"/jobs/{job_id}/tempo-map")
+        self.assertEqual(r.status_code, 409, r.text)
+
+        r = self.client.post(f"/jobs/{job_id}/align")
+        self.assertEqual(r.status_code, 200, r.text)
+
+        r = self.client.get(f"/jobs/{job_id}/tempo-map")
+        self.assertEqual(r.status_code, 200, r.text)
+        tm = r.json()
+        self.assertEqual(tm["matched_beat_count"], 8)
+        self.assertEqual(tm["interval_count"], 7)
+        # 漏拍造成的 60 BPM 间隔被忽略
+        self.assertEqual(tm["ignored_count"], 1)
+        self.assertEqual(len(tm["ignored_indices"]), 1)
+        detail = tm["ignored_intervals"][0]
+        self.assertEqual(
+            (detail["ref_start_index"], detail["ref_end_index"]), (1, 3)
+        )
+        self.assertEqual(detail["ref_span"], 2)
+        self.assertIn("outlier", detail["reasons"])
+        self.assertAlmostEqual(detail["raw_bpm"], 60.0, places=2)
+        # 稳定区间为 120 BPM
+        self.assertGreaterEqual(tm["event_count"], 1)
+        for ev in tm["events"]:
+            self.assertAlmostEqual(ev["bpm"], 120.0, places=2)
+            self.assertEqual(
+                ev["beat_count"],
+                ev["ref_end_index"] - ev["ref_start_index"] + 1,
+            )
+        # 事件按参考拍排序
+        starts = [ev["ref_start_index"] for ev in tm["events"]]
+        self.assertEqual(starts, sorted(starts))
+        # 回显实际使用的估计参数
+        self.assertEqual(tm["parameters"]["window_beats"], 5)
+        self.assertEqual(tm["parameters"]["window_size"], 5)
+
+    def test_tempo_map_query_params(self):
+        r = self.client.post("/jobs", json={
+            "reference_beats": [0.5 * i for i in range(8)],
+            "performance_onsets": [0.5 * i for i in range(8)],
+        })
+        job_id = r.json()["id"]
+        self.client.post(f"/jobs/{job_id}/align")
+
+        # window_beats 为偶数时实际窗口取奇数（4→3）
+        r = self.client.get(f"/jobs/{job_id}/tempo-map?window_beats=4")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["parameters"]["window_size"], 3)
+
+        # 自定义 BPM 范围（120 落在 [140,200] 外，全部忽略）
+        r = self.client.get(f"/jobs/{job_id}/tempo-map?min_bpm=140&max_bpm=200")
+        self.assertEqual(r.status_code, 200, r.text)
+        tm = r.json()
+        self.assertEqual(tm["events"], [])
+        self.assertEqual(len(tm["ignored_indices"]), 7)
+        self.assertTrue(
+            all("below_min_bpm" in i["reasons"] for i in tm["ignored_intervals"])
+        )
+
+        # min_bpm >= max_bpm → 400
+        r = self.client.get(f"/jobs/{job_id}/tempo-map?min_bpm=300&max_bpm=100")
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("min_bpm", r.json()["detail"])
+
+        # window_beats=0 / 负数 → 422（Query 约束）
+        r = self.client.get(f"/jobs/{job_id}/tempo-map?window_beats=0")
+        self.assertEqual(r.status_code, 422)
+        r = self.client.get(f"/jobs/{job_id}/tempo-map?min_bpm=-5")
+        self.assertEqual(r.status_code, 422)
+
+    def test_tempo_map_404(self):
+        r = self.client.get("/jobs/999999/tempo-map")
+        self.assertEqual(r.status_code, 404)
+
+    def test_tempo_map_too_few_matched_beats_conflicts(self):
+        # 单参考拍 + 单演奏音：只能产生 1 个匹配，无法估计间隔 → 409
+        r = self.client.post("/jobs", json={
+            "reference_beats": [0.0],
+            "performance_onsets": [0.0],
+            "params": {"band_width": 1},
+        })
+        job_id = r.json()["id"]
+        r = self.client.post(f"/jobs/{job_id}/align")
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get(f"/jobs/{job_id}/tempo-map")
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("匹配拍", r.json()["detail"])
+
+    def test_tempo_map_failed_job_conflicts(self):
+        # 直接把任务置为 error：/tempo-map 应返回 409 并提示上次对齐失败
+        import sqlite3
+        db_path = os.environ["ALIGN_DB_PATH"]
+        r = self.client.post("/jobs", json={
+            "reference_beats": [0.0, 0.5],
+            "performance_onsets": [0.0, 0.5],
+        })
+        job_id = r.json()["id"]
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "UPDATE jobs SET status='error', error=? WHERE id=?",
+                ("boom", job_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        r = self.client.get(f"/jobs/{job_id}/tempo-map")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("boom", r.json()["detail"])
+
     def test_legacy_db_without_anchors_column(self):
         # 模拟旧版数据库（jobs 表没有 anchors 列）：迁移后旧行可读、新任务可建
         import sqlite3

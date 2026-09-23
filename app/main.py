@@ -19,7 +19,8 @@ from .alignment import (
     validate_anchors,
 )
 from .database import get_db, init_db
-from .schemas import JobCreate, JobOut, JobSummary
+from .schemas import JobCreate, JobOut, JobSummary, TempoMap
+from .tempo import DEFAULT_MAX_BPM, DEFAULT_MIN_BPM, DEFAULT_WINDOW_BEATS, TempoError, TempoParams, build_tempo_map
 
 
 @asynccontextmanager
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
@@ -169,3 +170,62 @@ def get_job_result(job_id: int, db: sqlite3.Connection = Depends(get_db)):
             detail=f"上次对齐失败：{job['error']}",
         )
     return {"job_id": job_id, "result": job["result"]}
+
+
+@app.get(
+    "/jobs/{job_id}/tempo-map",
+    response_model=TempoMap,
+    tags=["jobs"],
+    summary="导出已完成任务的节奏曲线（tempo events）",
+)
+def get_job_tempo_map(
+    job_id: int,
+    window_beats: int = Query(
+        default=DEFAULT_WINDOW_BEATS, ge=1, le=128,
+        description="中位数窗口的间隔（拍）数上限，实际窗口取不大于该值的奇数",
+    ),
+    min_bpm: float = Query(default=DEFAULT_MIN_BPM, gt=0, description="合法 BPM 下限"),
+    max_bpm: float = Query(default=DEFAULT_MAX_BPM, gt=0, description="合法 BPM 上限"),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """根据 matched_beats 的相邻间隔估计局部 BPM 并压缩为 tempo events。
+
+    对每条相邻匹配间隔计算瞬时 BPM（``60 / 演奏时间差``），用居中中位数
+    窗口抑制漏拍 / 插入拍造成的异常间隔；原始 BPM 超出 ``[min_bpm,
+    max_bpm]`` 或与窗口中位数偏差过大的间隔被忽略（在 ``ignored_indices``
+    / ``ignored_intervals`` 中给出），其余稳定间隔按 BPM 归并为按参考拍
+    排序的 tempo events。
+
+    - 任务不存在：``404``
+    - 任务未完成（``pending``）或上次对齐失败（``error``）：``409``
+    - 匹配拍不足 2 个（无法估计任何间隔）：``409``
+    - ``min_bpm >= max_bpm`` 等参数非法：``400``
+    """
+    job = crud.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    if job["status"] == "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="任务尚未完成对齐"
+        )
+    if job["status"] == "error":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"上次对齐失败，无法导出节奏曲线：{job['error']}",
+        )
+    if min_bpm >= max_bpm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"min_bpm ({min_bpm}) 必须小于 max_bpm ({max_bpm})",
+        )
+    try:
+        params = TempoParams(
+            window_beats=window_beats, min_bpm=min_bpm, max_bpm=max_bpm
+        )
+        params.validate()
+        return build_tempo_map(job["result"] or {}, params)
+    except TempoError as exc:
+        # 匹配拍不足（无法估计节奏曲线）→ 409
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        )
