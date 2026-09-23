@@ -129,6 +129,40 @@ class AlignmentResult(BaseModel):
     statistics: dict[str, Any]
 
 
+class TempoEvent(BaseModel):
+    ref_start_index: int = Field(..., description="事件起拍：第一个匹配参考拍的 0 基索引")
+    ref_end_index: int = Field(
+        ..., description="事件结束拍（含）：区间内最后一个匹配参考拍的 0 基索引"
+    )
+    start_time: float = Field(..., description="事件起拍对应的演奏时间（秒）")
+    ref_time: float = Field(..., description="事件起拍对应的参考时间（秒）")
+    bpm: float = Field(..., description="该稳定区间的估计 BPM（区间内稳健 BPM 的中位数）")
+    beat_count: int = Field(
+        ...,
+        description=(
+            "覆盖拍数（ref_end_index − ref_start_index），被忽略间隔跨过的漏拍也计入；"
+            "相邻事件共享边界拍"
+        ),
+    )
+    gap_count: int = Field(
+        ..., description="并入本事件的相邻匹配间隔数（被忽略的异常间隔不计）"
+    )
+
+
+class TempoMapOut(BaseModel):
+    job_id: int
+    parameters: dict[str, Any]
+    matched_beat_count: int = Field(..., description="本次估计使用的匹配拍数")
+    events: list[TempoEvent] = Field(
+        default_factory=list,
+        description="按参考拍排序的 tempo events（稳定 BPM 区间，自该事件起拍生效）",
+    )
+    ignored_ref_indices: list[int] = Field(
+        default_factory=list,
+        description="被忽略的异常间隔起始参考拍索引（漏拍 / 插入拍残留或超 BPM 范围）",
+    )
+
+
 class JobSummary(BaseModel):
     id: int
     name: str | None

@@ -19,7 +19,8 @@ from .alignment import (
     validate_anchors,
 )
 from .database import get_db, init_db
-from .schemas import JobCreate, JobOut, JobSummary
+from .schemas import JobCreate, JobOut, JobSummary, TempoMapOut
+from .tempo import TempoMapError, build_tempo_map
 
 
 @asynccontextmanager
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
@@ -169,3 +170,59 @@ def get_job_result(job_id: int, db: sqlite3.Connection = Depends(get_db)):
             detail=f"上次对齐失败：{job['error']}",
         )
     return {"job_id": job_id, "result": job["result"]}
+
+
+@app.get(
+    "/jobs/{job_id}/tempo-map",
+    response_model=TempoMapOut,
+    tags=["jobs"],
+)
+def get_job_tempo_map(
+    job_id: int,
+    window_beats: int = Query(
+        default=5, ge=1, le=101,
+        description="局部 BPM 的滑动中位数窗口半径（拍数，取中心±(window_beats//2)）",
+    ),
+    min_bpm: float = Query(default=40.0, gt=0, description="接受的最小 BPM"),
+    max_bpm: float = Query(default=300.0, gt=0, description="接受的最大 BPM"),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """从已完成任务的 matched_beats 导出节奏曲线（tempo map）。
+
+    先按相邻匹配拍的参考拍跨度与演奏间隔估计局部 BPM，用滑动中位数窗口
+    抑制漏拍 / 插入拍造成的异常间隔（半速 / 倍速），再把相对差不超过 2%
+    的连续稳定区间压缩为按参考拍排序的 tempo events；异常间隔的起始参考拍
+    索引在 ``ignored_ref_indices`` 中返回（不切断事件）。
+
+    - 任务不存在：404
+    - 任务尚未对齐：409；上次对齐失败：400
+    - 匹配拍不足 2 个：409
+    - ``min_bpm >= max_bpm`` 或参数越界：422
+    """
+    job = crud.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    if job["status"] == "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="任务尚未对齐")
+    if job["status"] == "error":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"上次对齐失败：{job['error']}",
+        )
+    if min_bpm >= max_bpm:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="min_bpm 必须小于 max_bpm",
+        )
+
+    matched = (job["result"] or {}).get("matched_beats", [])
+    try:
+        tempo_map = build_tempo_map(
+            matched,
+            window_beats=window_beats,
+            min_bpm=min_bpm,
+            max_bpm=max_bpm,
+        )
+    except TempoMapError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return {"job_id": job_id, **tempo_map}
